@@ -40,7 +40,7 @@ sudo pacman -S gcc make libsodium toxcore opencl-headers ocl-icd mesa
 ```
 
 **Installation Example (Debian / Ubuntu):**
-```bash
+```
 sudo apt-get install build-essential libsodium-dev libtoxcore-dev ocl-icd-opencl-dev opencl-headers
 # You will also need to install the correct GPU drivers and OpenCL runtime for your hardware.
 ```
@@ -48,7 +48,7 @@ sudo apt-get install build-essential libsodium-dev libtoxcore-dev ocl-icd-opencl
 ### Verifying your OpenCL Setup
 
 Before compiling, make sure your system correctly detects your GPU. You can use a tool like `clinfo`:
-```bash
+```
 # Install clinfo (e.g., sudo pacman -S clinfo)
 clinfo
 ```
@@ -60,7 +60,7 @@ If the output shows your GPU and its platforms, you are ready to proceed. If not
 
 Compiling is straightforward with the provided `Makefile`. Just run:
 
-```bash
+```
 make
 ```
 
@@ -72,7 +72,7 @@ This will create an executable file named `tox_vanity_miner`.
 
 Run the program from your terminal. The only required argument is the address prefix you want.
 
-```bash
+```
 ./tox_vanity_miner -a <PREFIX> [OPTIONS]
 ```
 
@@ -90,12 +90,12 @@ Run the program from your terminal. The only required argument is the address pr
 **Examples:**
 
 - **Use GPU only:**
-  ```bash
+  ```
   ./tox_vanity_miner -a CAKE -m gpu
   ```
 
 - **Use 4 CPU threads only:**
-  ```bash
+  ```
   ./tox_vanity_miner -a CAKE -m cpu -t 4
   ```
 
