@@ -35,7 +35,8 @@ You will need the following dependencies installed (development headers are requ
         - **NVIDIA:** The proprietary NVIDIA drivers are required.
         - **Intel:** The `intel-compute-runtime` is typically needed.
 
-**Installation Example (Arch Linux / EndeavourOS):**```bash
+**Installation Example (Arch Linux / EndeavourOS):**
+```
 sudo pacman -S gcc make libsodium toxcore opencl-headers ocl-icd mesa
 ```
 
