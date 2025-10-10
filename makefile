@@ -4,11 +4,19 @@
 CC = gcc
 CFLAGS = -O2 -Wall -g # -O2 for optimization, -Wall for warnings, -g for debug symbols
 
+ifeq ($(OS),Windows_NT)
+    THREAD_LIB =
+    EXE = .exe
+else
+    THREAD_LIB = -lpthread
+    EXE =
+endif
+
 # Linker flags (libraries to link against)
-LDFLAGS = -ltoxcore -lsodium -lOpenCL -lpthread
+LDFLAGS = -ltoxcore -lsodium -lOpenCL $(THREAD_LIB)
 
 # The target executable name
-TARGET = tox_vanity_miner
+TARGET = tox_vanity_miner$(EXE)
 
 # Default rule
 all: $(TARGET)
@@ -19,6 +27,6 @@ $(TARGET): tox.c
 
 # Rule to clean up build files
 clean:
-	rm -f $(TARGET) *.o
+        rm -f $(TARGET) *.o
 
 .PHONY: all clean
