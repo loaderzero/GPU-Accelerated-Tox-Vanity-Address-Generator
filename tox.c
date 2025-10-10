@@ -61,8 +61,12 @@ cl_mem wanted_prefix_buf = NULL;
 cl_mem found_key_buf = NULL;
 cl_mem found_flag_buf = NULL;
 
-uint8_t gpu_found_private_key[32] = {0}; 
-char device_name_str[128] = {0}; 
+uint8_t gpu_found_private_key[32] = {0};
+char device_name_str[128] = {0};
+
+size_t gpu_global_work_size = (1 << 16);
+uint gpu_iterations_per_launch = (1 << 12);
+ulong gpu_current_nonce = 0;
 // ------------------------------------
 
 // Modes
@@ -377,13 +381,22 @@ int setup_opencl(char* wanted_address_string, uint wanted_len, uint nospam_val, 
                                     sizeof(uint), &initial_found_flag, &err);
     CHECK_CL_ERROR(err, "clCreateBuffer for found_flag_buf");
 
+    gpu_current_nonce = initial_rng_nonce;
+    if (gpu_global_work_size == 0) {
+        gpu_global_work_size = (1 << 16);
+    }
+    if (gpu_iterations_per_launch == 0) {
+        gpu_iterations_per_launch = (1 << 12);
+    }
+
     // 9. Set Kernel Arguments
     err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &wanted_prefix_buf); CHECK_CL_ERROR(err, "clSetKernelArg 0 (wanted_prefix)");
     err = clSetKernelArg(kernel, 1, sizeof(uint), &wanted_len);         CHECK_CL_ERROR(err, "clSetKernelArg 1 (wanted_len)");
     err = clSetKernelArg(kernel, 2, sizeof(cl_mem), &found_key_buf);    CHECK_CL_ERROR(err, "clSetKernelArg 2 (found_key_buf)");
     err = clSetKernelArg(kernel, 3, sizeof(cl_mem), &found_flag_buf);   CHECK_CL_ERROR(err, "clSetKernelArg 3 (found_flag_buf)");
     err = clSetKernelArg(kernel, 4, sizeof(uint), &nospam_val);         CHECK_CL_ERROR(err, "clSetKernelArg 4 (nospam)");
-    err = clSetKernelArg(kernel, 5, sizeof(ulong), &initial_rng_nonce); CHECK_CL_ERROR(err, "clSetKernelArg 5 (start_nonce)");
+    err = clSetKernelArg(kernel, 5, sizeof(ulong), &gpu_current_nonce); CHECK_CL_ERROR(err, "clSetKernelArg 5 (start_nonce)");
+    err = clSetKernelArg(kernel, 6, sizeof(uint), &gpu_iterations_per_launch); CHECK_CL_ERROR(err, "clSetKernelArg 6 (iterations)");
 
     return 0;
 }
@@ -391,15 +404,21 @@ int setup_opencl(char* wanted_address_string, uint wanted_len, uint nospam_val, 
 // Function to launch GPU search
 int run_gpu_search() {
     cl_int err;
-    // Define global work size (number of work-items)
-    // A power of 2 is often good. 2^20 (1,048,576) is a decent starting point.
-    // You can increase this for more parallelism, e.g., 1 << 22 or 1 << 24
-    size_t global_work_size = 1 << 16;
 
-    err = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, &global_work_size, NULL, 0, NULL, NULL);
+    err = clSetKernelArg(kernel, 5, sizeof(ulong), &gpu_current_nonce);
+    CHECK_CL_ERROR(err, "clSetKernelArg 5 (start_nonce)");
+    err = clSetKernelArg(kernel, 6, sizeof(uint), &gpu_iterations_per_launch);
+    CHECK_CL_ERROR(err, "clSetKernelArg 6 (iterations)");
+
+    err = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, &gpu_global_work_size, NULL, 0, NULL, NULL);
     CHECK_CL_ERROR(err, "clEnqueueNDRangeKernel");
     clFlush(command_queue); // Send commands to device
-    dbg(2, "GPU kernel launched with global_work_size: %zu\n", global_work_size);
+    dbg(2, "GPU kernel launched with global_work_size: %zu, iterations: %u, start_nonce: %lu\n",
+        gpu_global_work_size, gpu_iterations_per_launch, gpu_current_nonce);
+
+    gpu_current_nonce += (ulong)gpu_global_work_size * (ulong)gpu_iterations_per_launch;
+
+    return 0;
 }
 
 // Function to release OpenCL resources
@@ -411,6 +430,7 @@ void cleanup_opencl() {
     if (program) clReleaseProgram(program);
     if (command_queue) clReleaseCommandQueue(command_queue);
     if (context) clReleaseContext(context);
+    gpu_current_nonce = 0;
     dbg(9, "OpenCL resources released.\n");
 }
 
@@ -685,7 +705,14 @@ int main(int argc, char *argv[])
         }
         printf("Starting GPU search on %s...\n", device_name_str);
         dbg(2, "Starting GPU search on %s...\n", device_name_str);
-        run_gpu_search();
+        if (run_gpu_search() != 0) {
+            fprintf(stderr, "Failed to launch initial GPU kernel.\n");
+            dbg(0, "Failed to launch initial GPU kernel.\n");
+            cleanup_opencl();
+            if (wanted_address_string) free(wanted_address_string);
+            if (logfile) fclose(logfile);
+            return -1;
+        }
     }
 
     // --- Launch CPU-part ---
@@ -723,8 +750,6 @@ int main(int argc, char *argv[])
     // --- Main waiting loop ---
     fprintf(stderr, "Searching...\n");
     while (found_global == 0) {
-        yieldcpu(100); // Small delay to prevent busy-waiting
-
         // If GPU is active, check its flag
         if (found_global == 0 && (run_mode == MODE_GPU || run_mode == MODE_HYBRID)) {
             uint gpu_found_flag = 0;
@@ -753,7 +778,18 @@ int main(int argc, char *argv[])
                     dbg(2, "GPU found address but another worker (CPU) set the flag first.\n");
                 }
                 break; // Exit loop
+            } else if (found_global == 0) {
+                if (run_gpu_search() != 0) {
+                    fprintf(stderr, "Failed to relaunch GPU search. Stopping GPU worker.\n");
+                    dbg(0, "Failed to relaunch GPU search.\n");
+                    found_global = 1;
+                    break;
+                }
             }
+        }
+
+        if (found_global == 0) {
+            yieldcpu(10); // Small delay to prevent busy-waiting without stalling GPU relaunches
         }
     }
 
