@@ -21,30 +21,54 @@ This tool is experimental and can be unstable. The OpenCL kernel is designed to 
 
 ## Prerequisites & Dependencies
 
-This program is intended for **Linux** systems. It has been tested on Arch-based distributions (EndeavourOS).
+You need a working C toolchain, the Tox and libsodium libraries, and an OpenCL runtime. The exact packages depend on your operating system.
 
-You will need the following dependencies installed (development headers are required):
+### Linux
 
-1.  **A C Compiler & Build Tools:** `gcc` and `make`.
-2.  **libsodium-dev:** For cryptographic helper functions.
-3.  **libtoxcore-dev:** The core Tox library.
-4.  **OpenCL:**
-    *   **OpenCL Headers & ICD Loader:** `opencl-headers` and `ocl-icd`.
-    *   **GPU Drivers:** You need the correct OpenCL driver for your GPU.
-        - **AMD:** `mesa` drivers usually include the `rusticl` OpenCL implementation.
-        - **NVIDIA:** The proprietary NVIDIA drivers are required.
-        - **Intel:** The `intel-compute-runtime` is typically needed.
+1. **Build tools:** `gcc` (or `clang`) and `make`.
+2. **Tox & libsodium development headers:** `libtoxcore-dev`, `libsodium-dev`, or their distribution-specific equivalents.
+3. **OpenCL runtime:**
+   - **OpenCL headers & ICD loader:** `opencl-headers` and `ocl-icd` (or your distro's meta-package).
+   - **GPU driver/runtime:** install the vendor runtime that exposes OpenCL for your card.
+     - **AMD:** Mesa's `rusticl` implementation ships with recent Mesa packages.
+     - **NVIDIA:** proprietary driver (e.g. `nvidia-opencl-icd` on Debian/Ubuntu).
+     - **Intel:** `intel-compute-runtime` or `beignet` depending on GPU generation.
 
-**Installation Example (Arch Linux / EndeavourOS):**
-```
+**Arch / EndeavourOS**
+```bash
 sudo pacman -S gcc make libsodium toxcore opencl-headers ocl-icd mesa
 ```
 
-**Installation Example (Debian / Ubuntu):**
-```
+**Debian / Ubuntu**
+```bash
 sudo apt-get install build-essential libsodium-dev libtoxcore-dev ocl-icd-opencl-dev opencl-headers
-# You will also need to install the correct GPU drivers and OpenCL runtime for your hardware.
+# Install the matching OpenCL runtime for your GPU (e.g. nvidia-opencl-icd, intel-opencl-icd).
 ```
+
+### Windows
+
+There are two supported environments:
+
+1. **MSYS2 / MinGW-w64 (recommended for GCC users)**
+   - Install [MSYS2](https://www.msys2.org/).
+   - Open the "MSYS2 MinGW 64-bit" shell and install packages:
+     ```bash
+     pacman -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-make \
+         mingw-w64-x86_64-libsodium mingw-w64-x86_64-libtoxcore \
+         mingw-w64-x86_64-opencl-icd
+     ```
+   - Install the GPU vendor's OpenCL driver (NVIDIA/AMD/Intel) if it is not already present.
+
+2. **Visual Studio + vcpkg (for MSVC users)**
+   - Install [Visual Studio](https://visualstudio.microsoft.com/) with the "Desktop development with C++" workload.
+   - Install [vcpkg](https://github.com/microsoft/vcpkg) and integrate it with Visual Studio (`vcpkg integrate install`).
+   - Use vcpkg to install dependencies:
+     ```powershell
+     vcpkg install libsodium:x64-windows libtoxcore:x64-windows opencl:x64-windows
+     ```
+   - Ensure the GPU's OpenCL runtime is installed (typically bundled with the vendor driver).
+
+If you use MSYS2, the provided `makefile` will build the project directly. For MSVC users, open a "x64 Native Tools" command prompt, run `nmake /f makefile`, or create a new Visual Studio project that compiles `tox.c` with the same dependencies.
 
 ### Verifying your OpenCL Setup
 
@@ -53,7 +77,7 @@ Before compiling, make sure your system correctly detects your GPU. You can use 
 # Install clinfo (e.g., sudo pacman -S clinfo)
 clinfo
 ```
-If the output shows your GPU and its platforms, you are ready to proceed. If not, you need to fix your OpenCL driver installation.
+On Windows you can install [GPU Caps Viewer](https://www.ozone3d.net/gpu_caps_viewer/) or use the GPU vendor's diagnostic utility to check that OpenCL devices are visible. If your GPU does not appear, fix the driver/runtime installation before continuing.
 
 ---
 
