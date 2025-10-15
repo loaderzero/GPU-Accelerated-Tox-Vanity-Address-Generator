@@ -1863,12 +1863,13 @@ void bin_to_hex(char *hex, const uchar *bin, const int len) {
 }
 
 __kernel void find_vanity_address(
-    __global const char *wanted_prefix, 
-    const uint wanted_len,              
-    __global uchar *found_key,          
-    __global volatile uint *found_flag, 
-    const uint nospam,                  
-    const ulong start_nonce            
+    __global const char *wanted_prefix,
+    const uint wanted_len,
+    __global uchar *found_key,
+    __global volatile uint *found_flag,
+    const uint nospam,
+    const ulong start_nonce,
+    const uint iterations_per_item
 ) {
     uint gid = get_global_id(0);
 
@@ -1882,7 +1883,7 @@ __kernel void find_vanity_address(
     uchar tox_address_data[38]; // 32 pubkey + 4 nospam + 2 checksum
     char tox_address_hex[77];
 
-    while (*found_flag == 0) {
+    for (uint iter = 0; iter < iterations_per_item && *found_flag == 0; ++iter) {
         fill_random_bytes(private_key, 32, &rng_state);
 
         private_key[0] &= 248;

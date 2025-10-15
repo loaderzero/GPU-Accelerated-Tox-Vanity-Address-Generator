@@ -1,4 +1,4 @@
-#define _GNU_SOURCE 
+#define _GNU_SOURCE
 
 #include <ctype.h>
 #include <stdio.h>
@@ -7,22 +7,30 @@
 #include <string.h>
 #include <stdarg.h>
 #include <time.h>
+#include <stdatomic.h>
 #define CL_TARGET_OPENCL_VERSION 210
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/sysinfo.h> 
 
-#include <unistd.h>
-#include <getopt.h>
-#include <fcntl.h>
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  define NOMINMAX
+#  include <windows.h>
+#  include <process.h>
+#else
+#  include <sys/types.h>
+#  include <sys/stat.h>
+#  include <sys/sysinfo.h>
+#  include <unistd.h>
+#  include <fcntl.h>
+#  include <pthread.h>
+#endif
+
 #include <assert.h>
 #include <errno.h>
-#include <pthread.h>
 #include <signal.h>
 
-#include <CL/cl.h> 
+#include <CL/cl.h>
 
-#include <sodium/utils.h> 
+#include <sodium/utils.h>
 
 #include <tox/tox.h>
 
@@ -41,13 +49,19 @@ static const char global_version_string[] = "0.99.0";
 #define CURRENT_LOG_LEVEL 9 
 
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
-#define c_sleep(x) usleep(1000*x) 
+
+#if defined(_WIN32)
+#  define c_sleep(x) Sleep(x)
+#  define getpid _getpid
+#else
+#  define c_sleep(x) usleep(1000*(x))
+#endif
 
 
 const char *log_filename = "tox_vanity_addr_gen.log";
 FILE *logfile = NULL;
 
-volatile int found_global = 0;
+static atomic_int found_global;
 
 // ----------- OpenCL Globals -----------
 cl_platform_id platform_id = NULL;
@@ -61,8 +75,12 @@ cl_mem wanted_prefix_buf = NULL;
 cl_mem found_key_buf = NULL;
 cl_mem found_flag_buf = NULL;
 
-uint8_t gpu_found_private_key[32] = {0}; 
-char device_name_str[128] = {0}; 
+uint8_t gpu_found_private_key[32] = {0};
+char device_name_str[128] = {0};
+
+size_t gpu_global_work_size = (1 << 16);
+uint gpu_iterations_per_launch = (1 << 12);
+ulong gpu_current_nonce = 0;
 // ------------------------------------
 
 // Modes
@@ -71,6 +89,164 @@ typedef enum {
     MODE_GPU,
     MODE_HYBRID
 } run_mode_t;
+
+static size_t portable_strnlen(const char *s, size_t max_len)
+{
+    size_t i = 0;
+    if (!s) {
+        return 0;
+    }
+    while (i < max_len && s[i] != '\0') {
+        ++i;
+    }
+    return i;
+}
+
+static void print_usage(const char *progname)
+{
+    printf("Usage: %s [OPTIONS]\n", progname);
+    printf("  -v, --version                        show version\n");
+    printf("  -h, --help                           print this help and exit\n");
+    printf("  -a, --address <prefix>               Desired vanity address prefix (e.g., \"DEADBEEF\")\n");
+    printf("  -t, --threads <num>                  Number of CPU threads to use (default: logical CPU cores)\n");
+    printf("  -m, --mode <cpu|gpu|hybrid>          Operation mode (default: hybrid)\n");
+    printf("  -n, --nospam <value>                 Nospam value (integer or hex, e.g., 0x12345678)\n");
+}
+
+static int parse_mode_string(const char *value, run_mode_t *mode)
+{
+    if (!value || !mode) {
+        return -1;
+    }
+    if (strcmp(value, "cpu") == 0) {
+        *mode = MODE_CPU;
+        return 0;
+    }
+    if (strcmp(value, "gpu") == 0) {
+        *mode = MODE_GPU;
+        return 0;
+    }
+    if (strcmp(value, "hybrid") == 0) {
+        *mode = MODE_HYBRID;
+        return 0;
+    }
+    return -1;
+}
+
+static char *duplicate_uppercase_prefix(const char *value, uint *out_len)
+{
+    if (!value) {
+        return NULL;
+    }
+    size_t len = portable_strnlen(value, TOX_ADDRESS_SIZE * 2 + 1);
+    if (len > TOX_ADDRESS_SIZE * 2) {
+        return NULL;
+    }
+    char *result = (char *)calloc(1, TOX_ADDRESS_SIZE * 2 + 1);
+    if (!result) {
+        return NULL;
+    }
+    strncpy(result, value, TOX_ADDRESS_SIZE * 2);
+    result[TOX_ADDRESS_SIZE * 2] = '\0';
+    for (size_t i = 0; i < len; ++i) {
+        result[i] = (char)toupper((unsigned char)result[i]);
+    }
+    if (out_len) {
+        *out_len = (uint)len;
+    }
+    return result;
+}
+
+
+#if defined(_WIN32)
+typedef HANDLE portable_thread_t;
+#else
+typedef pthread_t portable_thread_t;
+#endif
+
+typedef void *(*thread_func_t)(void *);
+
+typedef struct thread_start_context {
+    thread_func_t func;
+    void *arg;
+} thread_start_context_t;
+
+#if defined(_WIN32)
+static unsigned __stdcall portable_thread_trampoline(void *param)
+{
+    thread_start_context_t *ctx = (thread_start_context_t *)param;
+    thread_func_t fn = ctx->func;
+    void *arg = ctx->arg;
+    free(ctx);
+    if (fn) {
+        fn(arg);
+    }
+    return 0U;
+}
+#endif
+
+static int portable_thread_create(portable_thread_t *thread, thread_func_t func, void *arg)
+{
+    if (!thread || !func) {
+        return EINVAL;
+    }
+
+#if defined(_WIN32)
+    thread_start_context_t *ctx = (thread_start_context_t *)malloc(sizeof(thread_start_context_t));
+    if (!ctx) {
+        return ENOMEM;
+    }
+    ctx->func = func;
+    ctx->arg = arg;
+    uintptr_t handle = _beginthreadex(NULL, 0, portable_thread_trampoline, ctx, 0, NULL);
+    if (handle == 0) {
+        int err = errno;
+        free(ctx);
+        if (err == 0) {
+            err = EAGAIN;
+        }
+        return err;
+    }
+    *thread = (HANDLE)handle;
+    return 0;
+#else
+    return pthread_create(thread, NULL, func, arg);
+#endif
+}
+
+static int portable_thread_join(portable_thread_t thread)
+{
+#if defined(_WIN32)
+    DWORD wait_result = WaitForSingleObject(thread, INFINITE);
+    if (wait_result == WAIT_FAILED) {
+        DWORD err = GetLastError();
+        CloseHandle(thread);
+        if (err == ERROR_INVALID_HANDLE) {
+            return ESRCH;
+        }
+        return EINVAL;
+    }
+    CloseHandle(thread);
+    return 0;
+#else
+    return pthread_join(thread, NULL);
+#endif
+}
+
+static int get_logical_cpu_count(void)
+{
+#if defined(_WIN32)
+    SYSTEM_INFO sysinfo;
+    GetNativeSystemInfo(&sysinfo);
+    if (sysinfo.dwNumberOfProcessors == 0) {
+        return 1;
+    }
+    return (int)sysinfo.dwNumberOfProcessors;
+#else
+    int count = get_nprocs();
+    return count > 0 ? count : 1;
+#endif
+}
 
 
 void dbg(int level, const char *fmt, ...)
@@ -157,7 +333,11 @@ time_t get_unix_time(void)
 
 void yieldcpu(uint32_t ms)
 {
+#if defined(_WIN32)
+    Sleep(ms);
+#else
     usleep(1000 * ms);
+#endif
 }
 
 void sigint_handler(int signo)
@@ -166,7 +346,7 @@ void sigint_handler(int signo)
     {
         fprintf(stderr, "received SIGINT, pid=%d. Setting found_global to stop workers.\n", getpid());
         dbg(2, "Received SIGINT, pid=%d. Setting found_global to stop workers.\n", getpid());
-        found_global = 1; // Устанавливаем флаг, чтобы все потоки и GPU остановились
+        atomic_store(&found_global, 1); // Устанавливаем флаг, чтобы все потоки и GPU остановились
     }
 }
 
@@ -377,13 +557,22 @@ int setup_opencl(char* wanted_address_string, uint wanted_len, uint nospam_val, 
                                     sizeof(uint), &initial_found_flag, &err);
     CHECK_CL_ERROR(err, "clCreateBuffer for found_flag_buf");
 
+    gpu_current_nonce = initial_rng_nonce;
+    if (gpu_global_work_size == 0) {
+        gpu_global_work_size = (1 << 16);
+    }
+    if (gpu_iterations_per_launch == 0) {
+        gpu_iterations_per_launch = (1 << 12);
+    }
+
     // 9. Set Kernel Arguments
     err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &wanted_prefix_buf); CHECK_CL_ERROR(err, "clSetKernelArg 0 (wanted_prefix)");
     err = clSetKernelArg(kernel, 1, sizeof(uint), &wanted_len);         CHECK_CL_ERROR(err, "clSetKernelArg 1 (wanted_len)");
     err = clSetKernelArg(kernel, 2, sizeof(cl_mem), &found_key_buf);    CHECK_CL_ERROR(err, "clSetKernelArg 2 (found_key_buf)");
     err = clSetKernelArg(kernel, 3, sizeof(cl_mem), &found_flag_buf);   CHECK_CL_ERROR(err, "clSetKernelArg 3 (found_flag_buf)");
     err = clSetKernelArg(kernel, 4, sizeof(uint), &nospam_val);         CHECK_CL_ERROR(err, "clSetKernelArg 4 (nospam)");
-    err = clSetKernelArg(kernel, 5, sizeof(ulong), &initial_rng_nonce); CHECK_CL_ERROR(err, "clSetKernelArg 5 (start_nonce)");
+    err = clSetKernelArg(kernel, 5, sizeof(ulong), &gpu_current_nonce); CHECK_CL_ERROR(err, "clSetKernelArg 5 (start_nonce)");
+    err = clSetKernelArg(kernel, 6, sizeof(uint), &gpu_iterations_per_launch); CHECK_CL_ERROR(err, "clSetKernelArg 6 (iterations)");
 
     return 0;
 }
@@ -391,15 +580,21 @@ int setup_opencl(char* wanted_address_string, uint wanted_len, uint nospam_val, 
 // Function to launch GPU search
 int run_gpu_search() {
     cl_int err;
-    // Define global work size (number of work-items)
-    // A power of 2 is often good. 2^20 (1,048,576) is a decent starting point.
-    // You can increase this for more parallelism, e.g., 1 << 22 or 1 << 24
-    size_t global_work_size = 1 << 16;
 
-    err = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, &global_work_size, NULL, 0, NULL, NULL);
+    err = clSetKernelArg(kernel, 5, sizeof(ulong), &gpu_current_nonce);
+    CHECK_CL_ERROR(err, "clSetKernelArg 5 (start_nonce)");
+    err = clSetKernelArg(kernel, 6, sizeof(uint), &gpu_iterations_per_launch);
+    CHECK_CL_ERROR(err, "clSetKernelArg 6 (iterations)");
+
+    err = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, &gpu_global_work_size, NULL, 0, NULL, NULL);
     CHECK_CL_ERROR(err, "clEnqueueNDRangeKernel");
     clFlush(command_queue); // Send commands to device
-    dbg(2, "GPU kernel launched with global_work_size: %zu\n", global_work_size);
+    dbg(2, "GPU kernel launched with global_work_size: %zu, iterations: %u, start_nonce: %lu\n",
+        gpu_global_work_size, gpu_iterations_per_launch, gpu_current_nonce);
+
+    gpu_current_nonce += (ulong)gpu_global_work_size * (ulong)gpu_iterations_per_launch;
+
+    return 0;
 }
 
 // Function to release OpenCL resources
@@ -411,6 +606,7 @@ void cleanup_opencl() {
     if (program) clReleaseProgram(program);
     if (command_queue) clReleaseCommandQueue(command_queue);
     if (context) clReleaseContext(context);
+    gpu_current_nonce = 0;
     dbg(9, "OpenCL resources released.\n");
 }
 
@@ -451,7 +647,7 @@ void *thread_find_address(void *data)
     uint32_t seconds = (uint32_t)time(NULL);
     int found_local = 0; // Local flag for this thread
 
-    while (found_global == 0) // Loop as long as global_found is not set
+    while (atomic_load(&found_global) == 0) // Loop as long as global_found is not set
     {
         tox_options_default(&options);
         // We don't load savedata, so tox_new generates a new key pair
@@ -475,8 +671,9 @@ void *thread_find_address(void *data)
             if (found_local == 1)
             {
                 // If this thread found it, try to set the global flag
-                // Use __sync_bool_compare_and_swap for atomic check-and-set
-                if (__sync_bool_compare_and_swap(&found_global, 0, 1)) {
+                // Atomically attempt to claim success for this worker
+                int expected = 0;
+                if (atomic_compare_exchange_strong(&found_global, &expected, 1)) {
                     fprintf(stderr, "\n** ADDRESS FOUND BY CPU THREAD! **\n");
                     dbg(2, "Address found by CPU thread!\n");
                     char tox_id_hex[TOX_ADDRESS_SIZE * 2 + 1];
@@ -497,7 +694,7 @@ void *thread_find_address(void *data)
             }
             
             // If this thread didn't find it, but found_global is now set by someone else, exit.
-            if (found_global != 0) {
+            if (atomic_load(&found_global) != 0) {
                 if (tox) {
                     tox_kill(tox);
                     tox = NULL;
@@ -544,95 +741,268 @@ int main(int argc, char *argv[])
     uint wanted_len = 0;
     uint nospam_val = 0; // Default nospam value, can be overridden by -n
 
-    int opt;
-    const char *short_opt = "hva:t:m:n:";
-    struct option long_opt[] =
-    {
-        {"help",          no_argument,       NULL, 'h'},
-        {"version",       no_argument,       NULL, 'v'},
-        {"address",       required_argument, NULL, 'a'},
-        {"threads",       required_argument, NULL, 't'},
-        {"mode",          required_argument, NULL, 'm'},
-        {"nospam",        required_argument, NULL, 'n'},
-        {NULL,            0,                 NULL,  0 }
-    };
+    int exit_requested = 0;
+    int exit_status = 0;
 
-    while ((opt = getopt_long(argc, argv, short_opt, long_opt, NULL)) != -1)
-    {
-        switch (opt)
-        {
-            case 'a':
-                wanted_address_string = calloc(1, TOX_ADDRESS_SIZE * 2 + 1); // Max size for hex Tox ID + null
-                if (wanted_address_string) {
-                    strncpy(wanted_address_string, optarg, TOX_ADDRESS_SIZE * 2);
-                    wanted_address_string[TOX_ADDRESS_SIZE * 2] = '\0';
-                    for (size_t i = 0; i < strlen(wanted_address_string); i++) {
-                        wanted_address_string[i] = toupper(wanted_address_string[i]); // Convert to uppercase for comparison
-                    }
-                    wanted_len = strlen(wanted_address_string);
-                    dbg(3, "Wanted Vanity Address: %s (len: %u)\n", wanted_address_string, wanted_len);
-                } else {
-                    fprintf(stderr, "Error: Failed to allocate memory for address string.\n");
-                    return -1;
+    atomic_store(&found_global, 0);
+
+    for (int i = 1; i < argc; ++i) {
+        const char *arg = argv[i];
+        const char *value = NULL;
+
+        if (!arg || arg[0] == '\0') {
+            continue;
+        }
+
+        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
+            print_usage(argv[0]);
+            exit_requested = 1;
+            exit_status = 0;
+            break;
+        }
+
+        if (strcmp(arg, "-v") == 0 || strcmp(arg, "--version") == 0) {
+            printf("Version: %s\n", global_version_string);
+            exit_requested = 1;
+            exit_status = 0;
+            break;
+        }
+
+        if (strncmp(arg, "--", 2) == 0) {
+            const char *name = arg + 2;
+            const char *eq = strchr(name, '=');
+            size_t name_len = 0;
+            if (eq) {
+                name_len = (size_t)(eq - name);
+                value = eq + 1;
+                if (value && value[0] == '\0') {
+                    value = NULL;
                 }
-                break;
+            } else {
+                name_len = strlen(name);
+            }
 
-            case 't':
-                wanted_threads = (uint32_t)atoi(optarg);
-                if (wanted_threads < 0) wanted_threads = 0; // Don't allow negative threads
-                dbg(3, "Using %d CPU Threads\n", (int)wanted_threads);
-                break;
+#define LONG_OPT_MATCH(optname) (name_len == strlen(optname) && strncmp(name, optname, name_len) == 0)
 
-            case 'm':
-                if (strcmp(optarg, "cpu") == 0) run_mode = MODE_CPU;
-                else if (strcmp(optarg, "gpu") == 0) run_mode = MODE_GPU;
-                else if (strcmp(optarg, "hybrid") == 0) run_mode = MODE_HYBRID;
-                else {
-                    fprintf(stderr, "Invalid mode: %s. Use 'cpu', 'gpu', or 'hybrid'.\n", optarg);
-                    return -2;
+            if (LONG_OPT_MATCH("address")) {
+                if (!value) {
+                    if (i + 1 >= argc) {
+                        fprintf(stderr, "Option --address requires a value.\n");
+                        exit_requested = 1;
+                        exit_status = -2;
+                        break;
+                    }
+                    value = argv[++i];
+                }
+                char *dup = duplicate_uppercase_prefix(value, &wanted_len);
+                if (!dup) {
+                    fprintf(stderr, "Error: Invalid or too long address prefix.\n");
+                    exit_requested = 1;
+                    exit_status = -2;
+                    break;
+                }
+                if (wanted_address_string) {
+                    free(wanted_address_string);
+                }
+                wanted_address_string = dup;
+                dbg(3, "Wanted Vanity Address: %s (len: %u)\n", wanted_address_string, wanted_len);
+                continue;
+            }
+
+            if (LONG_OPT_MATCH("threads")) {
+                if (!value) {
+                    if (i + 1 >= argc) {
+                        fprintf(stderr, "Option --threads requires a value.\n");
+                        exit_requested = 1;
+                        exit_status = -2;
+                        break;
+                    }
+                    value = argv[++i];
+                }
+                char *endptr = NULL;
+                long parsed = strtol(value, &endptr, 10);
+                if (!value || endptr == value || *endptr != '\0') {
+                    fprintf(stderr, "Invalid thread count: %s\n", value ? value : "(null)");
+                    exit_requested = 1;
+                    exit_status = -2;
+                    break;
+                }
+                if (parsed < 0) {
+                    parsed = 0;
+                }
+                wanted_threads = (int)parsed;
+                dbg(3, "Using %d CPU Threads\n", wanted_threads);
+                continue;
+            }
+
+            if (LONG_OPT_MATCH("mode")) {
+                if (!value) {
+                    if (i + 1 >= argc) {
+                        fprintf(stderr, "Option --mode requires a value.\n");
+                        exit_requested = 1;
+                        exit_status = -2;
+                        break;
+                    }
+                    value = argv[++i];
+                }
+                if (parse_mode_string(value, &run_mode) != 0) {
+                    fprintf(stderr, "Invalid mode: %s. Use 'cpu', 'gpu', or 'hybrid'.\n", value);
+                    exit_requested = 1;
+                    exit_status = -2;
+                    break;
                 }
                 dbg(3, "Run mode set to: %d\n", run_mode);
-                break;
+                continue;
+            }
 
-            case 'n':
-                nospam_val = (uint)strtoul(optarg, NULL, 0); // Allows decimal (123) or hex (0x123)
+            if (LONG_OPT_MATCH("nospam")) {
+                if (!value) {
+                    if (i + 1 >= argc) {
+                        fprintf(stderr, "Option --nospam requires a value.\n");
+                        exit_requested = 1;
+                        exit_status = -2;
+                        break;
+                    }
+                    value = argv[++i];
+                }
+                nospam_val = (uint)strtoul(value, NULL, 0);
                 dbg(3, "Nospam value set to: 0x%08X (%u)\n", nospam_val, nospam_val);
-                break;
+                continue;
+            }
 
-            case 'v':
-                printf("Version: %s\n", global_version_string);
-                if (logfile) fclose(logfile);
-                if (wanted_address_string) free(wanted_address_string);
-                return 0;
-
-            case 'h':
-                printf("Usage: %s [OPTIONS]\n", argv[0]);
-                printf("  -v, --version                        show version\n");
-                printf("  -h, --help                           print this help and exit\n");
-                printf("  -a, --address <prefix>               Desired vanity address prefix (e.g., \"DEADBEEF\")\n");
-                printf("  -t, --threads <num>                  Number of CPU threads to use (default: logical CPU cores)\n");
-                printf("  -m, --mode <cpu|gpu|hybrid>          Operation mode (default: hybrid)\n");
-                printf("  -n, --nospam <value>                 Nospam value (integer or hex, e.g., 0x12345678)\n");
-                if (logfile) fclose(logfile);
-                if (wanted_address_string) free(wanted_address_string);
-                return 0;
-
-            case '?':
-                fprintf(stderr, "Try `%s --help' for more information.\n", argv[0]);
-                if (logfile) fclose(logfile);
-                if (wanted_address_string) free(wanted_address_string);
-                return -2;
-
-            default:
-                fprintf(stderr, "%s: invalid option -- %c\n", argv[0], opt);
-                fprintf(stderr, "Try `%s --help' for more information.\n", argv[0]);
-                if (logfile) fclose(logfile);
-                if (wanted_address_string) free(wanted_address_string);
-                return -2;
+            fprintf(stderr, "Unknown option: %s\n", arg);
+            exit_requested = 1;
+            exit_status = -2;
+            break;
         }
+
+#undef LONG_OPT_MATCH
+
+        if (arg[0] == '-' && arg[1] != '\0') {
+            char opt = arg[1];
+            const char *attached = arg + 2;
+            if (attached && attached[0] == '\0') {
+                attached = NULL;
+            }
+
+            switch (opt) {
+                case 'a': {
+                    value = attached;
+                    if (!value) {
+                        if (i + 1 >= argc) {
+                            fprintf(stderr, "Option -a requires a value.\n");
+                            exit_requested = 1;
+                            exit_status = -2;
+                            break;
+                        }
+                        value = argv[++i];
+                    }
+                    char *dup = duplicate_uppercase_prefix(value, &wanted_len);
+                    if (!dup) {
+                        fprintf(stderr, "Error: Invalid or too long address prefix.\n");
+                        exit_requested = 1;
+                        exit_status = -2;
+                        break;
+                    }
+                    if (wanted_address_string) {
+                        free(wanted_address_string);
+                    }
+                    wanted_address_string = dup;
+                    dbg(3, "Wanted Vanity Address: %s (len: %u)\n", wanted_address_string, wanted_len);
+                    break;
+                }
+
+                case 't': {
+                    value = attached;
+                    if (!value) {
+                        if (i + 1 >= argc) {
+                            fprintf(stderr, "Option -t requires a value.\n");
+                            exit_requested = 1;
+                            exit_status = -2;
+                            break;
+                        }
+                        value = argv[++i];
+                    }
+                    char *endptr = NULL;
+                    long parsed = strtol(value, &endptr, 10);
+                    if (!value || endptr == value || *endptr != '\0') {
+                        fprintf(stderr, "Invalid thread count: %s\n", value ? value : "(null)");
+                        exit_requested = 1;
+                        exit_status = -2;
+                        break;
+                    }
+                    if (parsed < 0) {
+                        parsed = 0;
+                    }
+                    wanted_threads = (int)parsed;
+                    dbg(3, "Using %d CPU Threads\n", wanted_threads);
+                    break;
+                }
+
+                case 'm': {
+                    value = attached;
+                    if (!value) {
+                        if (i + 1 >= argc) {
+                            fprintf(stderr, "Option -m requires a value.\n");
+                            exit_requested = 1;
+                            exit_status = -2;
+                            break;
+                        }
+                        value = argv[++i];
+                    }
+                    if (parse_mode_string(value, &run_mode) != 0) {
+                        fprintf(stderr, "Invalid mode: %s. Use 'cpu', 'gpu', or 'hybrid'.\n", value);
+                        exit_requested = 1;
+                        exit_status = -2;
+                        break;
+                    }
+                    dbg(3, "Run mode set to: %d\n", run_mode);
+                    break;
+                }
+
+                case 'n': {
+                    value = attached;
+                    if (!value) {
+                        if (i + 1 >= argc) {
+                            fprintf(stderr, "Option -n requires a value.\n");
+                            exit_requested = 1;
+                            exit_status = -2;
+                            break;
+                        }
+                        value = argv[++i];
+                    }
+                    nospam_val = (uint)strtoul(value, NULL, 0);
+                    dbg(3, "Nospam value set to: 0x%08X (%u)\n", nospam_val, nospam_val);
+                    break;
+                }
+
+                default:
+                    fprintf(stderr, "Unknown option: %s\n", arg);
+                    exit_requested = 1;
+                    exit_status = -2;
+                    break;
+            }
+
+            if (exit_requested) {
+                break;
+            }
+
+            continue;
+        }
+
+        fprintf(stderr, "Unexpected argument: %s\n", arg);
+        exit_requested = 1;
+        exit_status = -2;
+        break;
     }
 
-    cpu_cores = get_nprocs();
+    if (exit_requested) {
+        if (logfile) fclose(logfile);
+        if (wanted_address_string) free(wanted_address_string);
+        return exit_status;
+    }
+
+    cpu_cores = get_logical_cpu_count();
     dbg(9, "Detected %d processors\n", cpu_cores);
 
     if (wanted_threads == -1) {
@@ -656,7 +1026,7 @@ int main(int argc, char *argv[])
     // Tox ID is 38 bytes, so 76 hex chars max
     if (wanted_len > TOX_ADDRESS_SIZE * 2) {
         dbg(0, "Address prefix too long.\n");
-        fprintf(stderr, "Error: Address prefix too long (max %d hex characters).\n", TOX_ADDRESS_SIZE * 2);
+        fprintf(stderr, "Error: Address prefix too long (max %zu hex characters).\n", (size_t)TOX_ADDRESS_SIZE * 2);
         if (logfile) fclose(logfile);
         if (wanted_address_string) free(wanted_address_string);
         return -2;
@@ -685,14 +1055,21 @@ int main(int argc, char *argv[])
         }
         printf("Starting GPU search on %s...\n", device_name_str);
         dbg(2, "Starting GPU search on %s...\n", device_name_str);
-        run_gpu_search();
+        if (run_gpu_search() != 0) {
+            fprintf(stderr, "Failed to launch initial GPU kernel.\n");
+            dbg(0, "Failed to launch initial GPU kernel.\n");
+            cleanup_opencl();
+            if (wanted_address_string) free(wanted_address_string);
+            if (logfile) fclose(logfile);
+            return -1;
+        }
     }
 
     // --- Launch CPU-part ---
-    pthread_t *tid = NULL; // Declared outside, initialized here
+    portable_thread_t *tid = NULL; // Declared outside, initialized here
     if (run_mode == MODE_CPU || run_mode == MODE_HYBRID) {
         if (wanted_threads > 0) {
-            tid = calloc(wanted_threads, sizeof(pthread_t));
+            tid = calloc((size_t)wanted_threads, sizeof(*tid));
             if (!tid) {
                 fprintf(stderr, "Failed to allocate memory for CPU threads.\n");
                 cleanup_opencl();
@@ -703,15 +1080,19 @@ int main(int argc, char *argv[])
             printf("Starting CPU search on %d threads...\n", wanted_threads);
             dbg(2, "Starting CPU search on %d threads...\n", wanted_threads);
             for (int c = 0; c < wanted_threads; c++) {
-                if (pthread_create(&(tid[c]), NULL, thread_find_address, (void *)wanted_address_string) != 0) {
-                    dbg(0, "Thread %d create failed: %s\n", c, strerror(errno));
-                    fprintf(stderr, "Error: Thread %d creation failed. Aborting CPU search for remaining threads.\n", c);
+                int create_err = portable_thread_create(&(tid[c]), thread_find_address, (void *)wanted_address_string);
+                if (create_err != 0) {
+#if defined(_WIN32)
+                    dbg(0, "Thread %d create failed (err=%d)\n", c, create_err);
+                    fprintf(stderr, "Error: Thread %d creation failed with error %d. Aborting CPU search for remaining threads.\n", c, create_err);
+#else
+                    dbg(0, "Thread %d create failed: %s\n", c, strerror(create_err));
+                    fprintf(stderr, "Error: Thread %d creation failed (%s). Aborting CPU search for remaining threads.\n", c, strerror(create_err));
+#endif
                     wanted_threads = c; // Update count of successfully launched threads
                     break;
-                } else {
-                    // pthread_setname_np(tid[c], "t_vanity"); // May not be available on all systems
-                    dbg(2, "Thread %d successfully created\n", c);
                 }
+                dbg(2, "Thread %d successfully created\n", c);
             }
         } else {
              fprintf(stderr, "Warning: Number of CPU threads set to 0. CPU search will not run.\n");
@@ -722,11 +1103,9 @@ int main(int argc, char *argv[])
 
     // --- Main waiting loop ---
     fprintf(stderr, "Searching...\n");
-    while (found_global == 0) {
-        yieldcpu(100); // Small delay to prevent busy-waiting
-
+    while (atomic_load(&found_global) == 0) {
         // If GPU is active, check its flag
-        if (found_global == 0 && (run_mode == MODE_GPU || run_mode == MODE_HYBRID)) {
+        if (atomic_load(&found_global) == 0 && (run_mode == MODE_GPU || run_mode == MODE_HYBRID)) {
             uint gpu_found_flag = 0;
             // Read flag value from GPU memory to CPU memory
             cl_int err = clEnqueueReadBuffer(command_queue, found_flag_buf, CL_TRUE, 0, sizeof(uint), &gpu_found_flag, 0, NULL, NULL);
@@ -734,13 +1113,14 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "Error reading found_flag_buf from GPU: %s\n", clGetErrorString(err));
                 dbg(0, "Error reading found_flag_buf from GPU: %s\n", clGetErrorString(err));
                 // If we can't read the flag, something is wrong, better stop.
-                found_global = 1; // Force exit
+                atomic_store(&found_global, 1); // Force exit
                 break;
             }
 
             if (gpu_found_flag) {
                 // Atomically set found_global to 1. Only the first one to do this wins.
-                if (__sync_bool_compare_and_swap(&found_global, 0, 1)) {
+                int expected = 0;
+                if (atomic_compare_exchange_strong(&found_global, &expected, 1)) {
                     // We were the first to find, so retrieve and save the key
                     err = clEnqueueReadBuffer(command_queue, found_key_buf, CL_TRUE, 0, 32, gpu_found_private_key, 0, NULL, NULL);
                     if (err == CL_SUCCESS) {
@@ -753,7 +1133,18 @@ int main(int argc, char *argv[])
                     dbg(2, "GPU found address but another worker (CPU) set the flag first.\n");
                 }
                 break; // Exit loop
+            } else if (atomic_load(&found_global) == 0) {
+                if (run_gpu_search() != 0) {
+                    fprintf(stderr, "Failed to relaunch GPU search. Stopping GPU worker.\n");
+                    dbg(0, "Failed to relaunch GPU search.\n");
+                    atomic_store(&found_global, 1);
+                    break;
+                }
             }
+        }
+
+        if (atomic_load(&found_global) == 0) {
+            yieldcpu(10); // Small delay to prevent busy-waiting without stalling GPU relaunches
         }
     }
 
@@ -764,10 +1155,15 @@ int main(int argc, char *argv[])
     // Wait for CPU threads to finish (if they were launched)
     if (tid) {
         for (int c = 0; c < wanted_threads; c++) {
-            if (pthread_join(tid[c], NULL) == 0) { // All threads should now terminate due to found_global
+            int join_err = portable_thread_join(tid[c]);
+            if (join_err == 0) {
                 dbg(9, "CPU thread %d joined.\n", c);
             } else {
-                dbg(1, "Failed to join CPU thread %d: %s\n", c, strerror(errno));
+#if defined(_WIN32)
+                dbg(1, "Failed to join CPU thread %d (err=%d)\n", c, join_err);
+#else
+                dbg(1, "Failed to join CPU thread %d: %s\n", c, strerror(join_err));
+#endif
             }
         }
         free(tid);
